@@ -1,5 +1,6 @@
 import queue
 import threading
+import pickle
 from rprint import print
 
 
@@ -139,18 +140,78 @@ class Router:
         self.name = name
         #create a list of interfaces
         self.intf_L = [Interface(max_queue_size) for _ in range(len(cost_D))]
-        #save neighbors and interfeces on which we connect to them
+        #save neighbors and interfaces on which we connect to them
         self.cost_D = cost_D    # {neighbor: {interface: cost}}
         #TODO: set up the routing table for connected hosts
+
         self.rt_tbl_D = {}      # {destination: {router: cost}}
+        self.fwd_tbl_D = {}     # {destination: interface}
+        for neighbor in cost_D:
+            for interface in cost_D[neighbor]:
+                self.rt_tbl_D[neighbor] = {self.name: cost_D[neighbor][interface]}
+                # initialize forwarding table with neighbors
+                self.fwd_tbl_D[neighbor] = interface
+        # add self to routing table
+        self.rt_tbl_D[self.name] = {self.name: 0}
         print('%s: Initialized routing table' % self)
         self.print_routes()
-    
+
         
     ## Print routing table
     def print_routes(self):
         #TODO: print the routes as a two dimensional table
-        print(self.rt_tbl_D)
+
+        destinations_L = []
+        routers_L = []
+        sample_inner_dict = None    # used to determine known routers
+
+        for destination in self.rt_tbl_D:
+            sample_inner_dict = self.rt_tbl_D[destination]
+            destinations_L.append(destination)
+        for router in sample_inner_dict:
+            routers_L.append(router)
+        # print header row
+        for i in range(len(destinations_L) + 1):
+            if i == 0:
+                print('╒══════', end='')
+            elif i == (len(destinations_L)):
+                print('╤══════╕')
+            else:
+                print('╤══════',end='')
+        print('| ' + self.name + '   |', end='')
+        for destination in self.rt_tbl_D:
+            print('   ' + destination + ' |', end='')
+        for i in range(len(destinations_L) + 1):
+            if i == 0:
+                print('\n╞══════', end='')
+            elif i == (len(destinations_L)):
+                print('╪══════╡')
+            else:
+                print('╪══════',end='')
+        # print body rows
+        for i in range(len(routers_L)):
+            # print row header
+            print('| ' + routers_L[i] + '   |', end='')
+            for j in range(len(destinations_L)):
+                # print cost values
+                print('    ' + str(self.rt_tbl_D[destinations_L[j]][routers_L[i]]) + ' |', end='')
+                # {'H2': {'RB': 3, 'RA': 0}, 'RA': {'RB': 1}, 'RA': 0, 'RB': {'RB': 0, 'RA': 1}, 'H1': {'RB': 0, 'RA': 1}
+            if (i != (len(routers_L)) - 1):
+                for i in range(len(destinations_L) + 1):
+                    if i == 0:
+                        print('\n├──────', end='')
+                    elif i == (len(destinations_L)):
+                        print('┼──────┤')
+                    else:
+                        print('┼──────', end='')
+            else:
+                for i in range(len(destinations_L) + 1):
+                    if i == 0:
+                        print('\n╘══════', end='')
+                    elif i == (len(destinations_L)):
+                        print('╧══════╛')
+                    else:
+                        print('╧══════', end='')
 
 
     ## called when printing the object
@@ -184,9 +245,13 @@ class Router:
             # TODO: Here you will need to implement a lookup into the 
             # forwarding table to find the appropriate outgoing interface
             # for now we assume the outgoing interface is 1
-            self.intf_L[1].put(p.to_byte_S(), 'out', True)
-            print('%s: forwarding packet "%s" from interface %d to %d' % \
-                (self, p, i, 1))
+
+            interface = self.fwd_tbl_D[p.dst]
+            self.intf_L[interface].put(p.to_byte_S(), 'out', True)
+            # I removed the 'to interface %d' portion of the below print because I could find no way to
+            # determine the interface it would be arriving on at the next router/host
+            print('%s: forwarding packet "%s" on interface %d' % \
+                (self, p, interface))
         except queue.Full:
             print('%s: packet "%s" lost on interface %d' % (self, p, i))
             pass
@@ -194,16 +259,23 @@ class Router:
 
     ## send out route update
     # @param i Interface number on which to send out a routing update
-    def send_routes(self, i):
+    def send_routes(self):
         # TODO: Send out a routing table update
+
         #create a routing table update packet
-        p = NetworkPacket(0, 'control', 'DUMMY_ROUTING_TABLE')
-        try:
-            print('%s: sending routing update "%s" from interface %d' % (self, p, i))
-            self.intf_L[i].put(p.to_byte_S(), 'out', True)
-        except queue.Full:
-            print('%s: packet "%s" lost on interface %d' % (self, p, i))
-            pass
+        routing_table_bytes = pickle.dumps(self.rt_tbl_D)
+        p = NetworkPacket(0, 'control', routing_table_bytes.decode('latin1'))
+
+        for neighbor in self.cost_D:
+            if (neighbor.startswith('R')):
+                # sends updates to all neighbors that are routers
+                for interface in self.cost_D[neighbor]:
+                    try:
+                        print('%s: sending routing update "%s" from interface %d' % (self, p, int(interface)))
+                        self.intf_L[int(interface)].put(p.to_byte_S(), 'out', True)
+                    except queue.Full:
+                        print('%s: packet "%s" lost on interface %d' % (self, p, int(interface)))
+                        pass
 
 
     ## forward the packet according to the routing table
@@ -211,9 +283,45 @@ class Router:
     def update_routes(self, p, i):
         #TODO: add logic to update the routing tables and
         # possibly send out routing updates
-        print('%s: Received routing update %s from interface %d' % (self, p, i))
 
-                
+        print('%s: Received routing update %s from interface %d' % (self, p, i))
+        routing_table_msg = pickle.loads(p.data_S.encode('latin1'))
+        # examine incoming routing table
+        for destination in routing_table_msg:
+            # find unknown destinations
+            if destination not in self.rt_tbl_D.keys():
+                self.rt_tbl_D[destination] = {self.name: 0}
+                self.fwd_tbl_D[destination] = 99        # placeholder value until next-hop is known
+            # examine known routers in incoming routing table
+            for router in routing_table_msg[destination]:
+                if router in self.cost_D.keys():
+                    # router is a neighbor of self
+                    self.rt_tbl_D[destination][router] = routing_table_msg[destination][router]
+                    for rt_tbl_destination in self.rt_tbl_D:
+                        if rt_tbl_destination not in routing_table_msg.keys():
+                            self.rt_tbl_D[rt_tbl_destination][router] = 0
+        # Bellman-Ford equation
+        for destination in self.rt_tbl_D:
+            if destination != self.name:
+                prev_value = self.rt_tbl_D[destination][self.name]
+                min_cost = self.rt_tbl_D[destination][self.name]
+                min_cost_next_hop = None
+                for router in self.rt_tbl_D[destination]:
+                    if router != self.name and self.rt_tbl_D[destination][router] != 0:
+                        # look at every other known router in network
+                        cost_to_dest = self.rt_tbl_D[router][self.name] + self.rt_tbl_D[destination][router]
+                        if min_cost == 0 or cost_to_dest < min_cost:
+                            min_cost = cost_to_dest
+                            min_cost_next_hop = router
+                if min_cost != prev_value:
+                    # cost value has changed
+                    self.rt_tbl_D[destination][self.name] = min_cost
+                    for interface in self.cost_D[min_cost_next_hop]:
+                        self.fwd_tbl_D[destination] = interface
+                        break
+                    self.send_routes()
+
+
     ## thread target for the host to keep forwarding data
     def run(self):
         print (threading.currentThread().getName() + ': Starting')
